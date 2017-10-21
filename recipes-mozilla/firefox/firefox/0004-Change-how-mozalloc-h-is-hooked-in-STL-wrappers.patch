@@ -1,0 +1,207 @@
+# HG changeset patch
+# User Mike Hommey <mh+mozilla@glandium.org>
+# Date 1463557039 -32400
+#      Wed May 18 16:37:19 2016 +0900
+# Node ID 68da139d0866977c0ada86319fa94388f2255446
+# Parent  a640e6fa8ab9977fb6c5bcf63dc4daca6699477b
+Bug 1269171 - Change how mozalloc.h is hooked in STL wrappers. r=froydnj
+
+Since the introduction of the STL wrappers, they have included
+mozalloc.h, and multiple times, we've hit header reentrancy problems,
+and worked around them as best as we could.
+
+Taking a step back, all mozalloc.h does is:
+- declare moz_* allocator functions.
+- define inline implementations of various operator new/delete variants.
+
+The first only requires the functions to be declared before they are used,
+so mozalloc.h only needs to be included before anything that would use
+those functions.
+
+The second doesn't actually require a specific order, as long as the
+declaration for those functions comes before their use, and they are
+either declared in <new> or implicitly by the C++ compiler.
+
+So all in all, it doesn't matter that mozalloc.h is included before the
+wrapped STL headers. What matters is that it's included when STL headers
+are included. So arrange things such that mozalloc.h is included after
+the first wrapped STL header is fully preprocessed (and all its includes
+have been included).
+
+diff -r a640e6fa8ab9 -r 68da139d0866 config/gcc-stl-wrapper.template.h
+--- a/config/gcc-stl-wrapper.template.h	Thu May 19 14:41:14 2016 +0900
++++ b/config/gcc-stl-wrapper.template.h	Wed May 18 16:37:19 2016 +0900
+@@ -17,32 +17,6 @@
+ // Silence "warning: #include_next is a GCC extension"
+ #pragma GCC system_header
+ 
+-// Don't include mozalloc for cstdlib. See bug 1245076.
+-#ifndef moz_dont_include_mozalloc_for_cstdlib
+-#  define moz_dont_include_mozalloc_for_cstdlib
+-#endif
+-#ifndef moz_dont_include_mozalloc_for_${HEADER}
+-// mozalloc.h wants <new>; break the cycle by always explicitly
+-// including <new> here.  NB: this is a tad sneaky.  Sez the gcc docs:
+-//
+-//    `#include_next' does not distinguish between <file> and "file"
+-//    inclusion, nor does it check that the file you specify has the
+-//    same name as the current file. It simply looks for the file
+-//    named, starting with the directory in the search path after the
+-//    one where the current file was found.
+-#  include_next <new>
+-
+-// See if we're in code that can use mozalloc.  NB: this duplicates
+-// code in nscore.h because nscore.h pulls in prtypes.h, and chromium
+-// can't build with that being included before base/basictypes.h.
+-#  if !defined(XPCOM_GLUE) && !defined(NS_NO_XPCOM) && !defined(MOZ_NO_MOZALLOC)
+-#    include "mozilla/mozalloc.h"
+-#  else
+-#    error "STL code can only be used with infallible ::operator new()"
+-#  endif
+-
+-#endif
+-
+ #if defined(DEBUG) && !defined(_GLIBCXX_DEBUG)
+ // Enable checked iterators and other goodies
+ //
+@@ -53,10 +27,34 @@
+ //  # define _GLIBCXX_DEBUG 1
+ #endif
+ 
++// Don't include mozalloc for cstdlib. See bug 1245076.
++#ifndef moz_dont_include_mozalloc_for_cstdlib
++#  define moz_dont_include_mozalloc_for_cstdlib
++#endif
++
++// Include mozalloc after the STL header and all other headers it includes
++// have been preprocessed.
++#if !defined(MOZ_INCLUDE_MOZALLOC_H) && \
++    !defined(moz_dont_include_mozalloc_for_${HEADER})
++#  define MOZ_INCLUDE_MOZALLOC_H
++#  define MOZ_INCLUDE_MOZALLOC_H_FROM_${HEADER}
++#endif
++
+ #pragma GCC visibility push(default)
+ #include_next <${HEADER}>
+ #pragma GCC visibility pop
+ 
++#ifdef MOZ_INCLUDE_MOZALLOC_H_FROM_${HEADER}
++// See if we're in code that can use mozalloc.  NB: this duplicates
++// code in nscore.h because nscore.h pulls in prtypes.h, and chromium
++// can't build with that being included before base/basictypes.h.
++#  if !defined(XPCOM_GLUE) && !defined(NS_NO_XPCOM) && !defined(MOZ_NO_MOZALLOC)
++#    include "mozilla/mozalloc.h"
++#  else
++#    error "STL code can only be used with infallible ::operator new()"
++#  endif
++#endif
++
+ // gcc calls a __throw_*() function from bits/functexcept.h when it
+ // wants to "throw an exception".  functexcept exists nominally to
+ // support -fno-exceptions, but since we'll always use the system
+diff -r a640e6fa8ab9 -r 68da139d0866 config/make-stl-wrappers.py
+--- a/config/make-stl-wrappers.py	Thu May 19 14:41:14 2016 +0900
++++ b/config/make-stl-wrappers.py	Wed May 18 16:37:19 2016 +0900
+@@ -30,7 +30,6 @@
+         os.mkdir(outdir)
+ 
+     template = open(template_file, 'r').read()
+-    path_to_new = header_path('new', compiler)
+ 
+     for header in open(header_list_file, 'r'):
+         header = header.rstrip()
+@@ -40,8 +39,7 @@
+         path = header_path(header, compiler)
+         with FileAvoidWrite(os.path.join(outdir, header)) as f:
+             f.write(string.Template(template).substitute(HEADER=header,
+-                                                         HEADER_PATH=path,
+-                                                         NEW_HEADER_PATH=path_to_new))
++                                                         HEADER_PATH=path))
+ 
+ 
+ if __name__ == '__main__':
+diff -r a640e6fa8ab9 -r 68da139d0866 config/msvc-stl-wrapper.template.h
+--- a/config/msvc-stl-wrapper.template.h	Thu May 19 14:41:14 2016 +0900
++++ b/config/msvc-stl-wrapper.template.h	Wed May 18 16:37:19 2016 +0900
+@@ -8,35 +8,23 @@
+ #ifndef mozilla_${HEADER}_h
+ #define mozilla_${HEADER}_h
+ 
+-#ifndef MOZ_HAVE_INCLUDED_ALLOC
+-#define MOZ_HAVE_INCLUDED_ALLOC
+-
+ #if _HAS_EXCEPTIONS
+ #  error "STL code can only be used with -fno-exceptions"
+ #endif
+ 
++// Include mozalloc after the STL header and all other headers it includes
++// have been preprocessed.
++#if !defined(MOZ_INCLUDE_MOZALLOC_H)
++#  define MOZ_INCLUDE_MOZALLOC_H
++#  define MOZ_INCLUDE_MOZALLOC_H_FROM_${HEADER}
++#endif
++
+ // Code built with !_HAS_EXCEPTIONS calls std::_Throw(), but the win2k
+ // CRT doesn't export std::_Throw().  So we define it.
+ #ifndef mozilla_Throw_h
+ #  include "mozilla/throw_msvc.h"
+ #endif
+ 
+-// Code might include <new> before other wrapped headers, but <new>
+-// includes <exception> and so we want to wrap it.  But mozalloc.h
+-// wants <new> also, so we break the cycle by always explicitly
+-// including <new> here.
+-#include <${NEW_HEADER_PATH}>
+-
+-// See if we're in code that can use mozalloc.  NB: this duplicates
+-// code in nscore.h because nscore.h pulls in prtypes.h, and chromium
+-// can't build with that being included before base/basictypes.h.
+-#if !defined(XPCOM_GLUE) && !defined(NS_NO_XPCOM) && !defined(MOZ_NO_MOZALLOC)
+-#  include "mozilla/mozalloc.h"
+-#else
+-#  error "STL code can only be used with infallible ::operator new()"
+-#endif
+-#endif /* MOZ_HAVE_INCLUDED_ALLOC */
+-
+ #ifdef _DEBUG
+ // From
+ //   http://msdn.microsoft.com/en-us/library/aa985982%28VS.80%29.aspx
+@@ -75,4 +63,15 @@
+ 
+ #pragma warning( pop )
+ 
++#ifdef MOZ_INCLUDE_MOZALLOC_H_FROM_${HEADER}
++// See if we're in code that can use mozalloc.  NB: this duplicates
++// code in nscore.h because nscore.h pulls in prtypes.h, and chromium
++// can't build with that being included before base/basictypes.h.
++#  if !defined(XPCOM_GLUE) && !defined(NS_NO_XPCOM) && !defined(MOZ_NO_MOZALLOC)
++#    include "mozilla/mozalloc.h"
++#  else
++#    error "STL code can only be used with infallible ::operator new()"
++#  endif
++#endif
++
+ #endif  // if mozilla_${HEADER}_h
+diff -r a640e6fa8ab9 -r 68da139d0866 memory/mozalloc/mozalloc.h
+--- a/memory/mozalloc/mozalloc.h	Thu May 19 14:41:14 2016 +0900
++++ b/memory/mozalloc/mozalloc.h	Wed May 18 16:37:19 2016 +0900
+@@ -12,10 +12,17 @@
+  * https://bugzilla.mozilla.org/show_bug.cgi?id=427099
+  */
+ 
+-#include <stdlib.h>
+-#include <string.h>
+ #if defined(__cplusplus)
+ #  include <new>
++// Since libstdc++ 6, including the C headers (e.g. stdlib.h) instead of the
++// corresponding C++ header (e.g. cstdlib) can cause confusion in C++ code
++// using things defined there. Specifically, with stdlib.h, the use of abs()
++// in gfx/graphite2/src/inc/UtfCodec.h somehow ends up picking the wrong abs()
++#  include <cstdlib>
++#  include <cstring>
++#else
++#  include <stdlib.h>
++#  include <string.h>
+ #endif
+ 
+ #if defined(__cplusplus)
